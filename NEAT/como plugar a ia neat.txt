@@ -1,0 +1,10 @@
+# NEAT
+def make_predict(net):
+    def fn(state):
+        out = net.activate(state)
+        return out.index(max(out))   # retorna 0, 1 ou 2
+    return fn
+
+env = DinoGame(render=True)
+ai_list = [make_predict(net) for net in neat_population]
+result  = env.play_population_mode(ai_list, generation=gen_num)

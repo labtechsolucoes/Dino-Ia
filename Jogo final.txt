@@ -1,0 +1,1508 @@
+#!/usr/bin/env python3
+"""
+dino_env.py — Clone do Jogo do Dinossauro do Google (Python + Pygame)
+=====================================================================
+
+Arquitetura com dois modos de execução:
+
+  1. MODO TREINAMENTO (RL):
+     - Sem renderização, alta velocidade.
+     - Interface: reset() → state, play_step(action) → (state, reward, done, score)
+
+  2. MODO DUELO (Humano vs IA):
+     - Renderização 60 FPS, dois dinossauros simultâneos.
+     - Interface: play_versus_mode(ai_predict_function)
+
+Execução:
+  python dino_env.py --mode versus    (Humano vs IA — padrão)
+  python dino_env.py --mode train     (RL sem renderização)
+  python dino_env.py --mode play      (Jogar sozinho)
+
+Autor: Gerado via IA
+"""
+
+import pygame
+import random
+import sys
+import colorsys
+
+# ╔═══════════════════════════════════════════════════════════════╗
+# ║              GERADOR DE CORES DISTINTAS                      ║
+# ╚═══════════════════════════════════════════════════════════════╝
+
+def generate_distinct_colors(n: int) -> list:
+    """
+    Gera N cores visualmente distintas e vibrantes distribuídas
+    uniformemente na roda de cores HSV.
+
+    Usado pelo play_population_mode() para colorir automaticamente
+    cada dino de uma geração com uma cor única.
+
+    Args:
+        n: Número de cores a gerar.
+
+    Returns:
+        Lista de N tuplas RGB (r, g, b), cada valor em [0, 255].
+
+    Exemplo:
+        cores = generate_distinct_colors(100)
+        for i, cor in enumerate(cores):
+            dino = Dino(x=80, color=cor, name=f"Agente_{i}")
+    """
+    colors = []
+    for i in range(n):
+        # Distribui hue uniformemente em [0, 1)
+        hue = i / n
+        # Saturação e brilho altos para cores vivas e legíveis
+        # Alterna levemente para evitar cores muito semelhantes quando n é grande
+        saturation = 0.85 + 0.10 * ((i % 3) / 3.0)
+        value      = 0.90 + 0.08 * ((i % 2) / 2.0)
+        r, g, b = colorsys.hsv_to_rgb(hue, saturation, value)
+        colors.append((int(r * 255), int(g * 255), int(b * 255)))
+    return colors
+
+
+# ╔═══════════════════════════════════════════════════════════════╗
+# ║                    CONSTANTES DO JOGO                        ║
+# ╚═══════════════════════════════════════════════════════════════╝
+
+SCREEN_WIDTH  = 1000
+SCREEN_HEIGHT = 300
+GROUND_Y      = 240        # Linha do chão
+FPS           = 60
+
+# --- Paleta monocromática fiel ao original do Google ---
+BG_COLOR       = (247, 247, 247)   # Fundo branco-cinza
+DINO_COLOR     = (83,  83,  83)    # Cinza escuro original (#535353)
+OBSTACLE_COLOR = (83,  83,  83)
+GROUND_COLOR   = (83,  83,  83)
+CLOUD_COLOR    = (210, 210, 210)
+WHITE          = (247, 247, 247)
+TEXT_COLOR     = (83,  83,  83)
+
+# No modo versus, IA fica azul para diferenciar
+PLAYER_COLOR   = (83,  83,  83)
+AI_COLOR       = (60,  100, 160)
+
+# --- Pixel scale: cada "pixel" do sprite = P x P pixels reais ---
+P = 3
+
+# --- Dimensões do Dinossauro (em pixels reais) ---
+DINO_W       = 22 * P
+DINO_H       = 26 * P
+DINO_DUCK_W  = 30 * P
+DINO_DUCK_H  = 16 * P
+
+# --- Física ---
+GRAVITY        = 1.1
+JUMP_VELOCITY  = -17.0
+INITIAL_SPEED  = 8.0
+MAX_SPEED      = 22.0
+SPEED_INCREMENT= 0.002
+
+# --- Obstáculos ---
+MIN_OBSTACLE_GAP = 300
+MAX_OBSTACLE_GAP = 600
+BIRD_Y_OPTIONS   = [GROUND_Y - 15, GROUND_Y - 48, GROUND_Y - 90]
+
+# --- Ações do Agente RL ---
+ACTION_NONE = 0
+ACTION_JUMP = 1
+ACTION_DUCK = 2
+
+
+# ╔═══════════════════════════════════════════════════════════════╗
+# ║              SPRITES EM PIXEL ART (grids 0/1)               ║
+# ╚═══════════════════════════════════════════════════════════════╝
+# Cada sprite é uma lista de strings. '#' = pixel preenchido, ' ' = vazio.
+# 'X' = olho de morto (sobreposto em branco).
+# São desenhados como blocos P×P de pixels reais.
+
+# --- T-Rex correndo (frame 1) ---
+TREX_RUN1 = [
+    "           ########## ",
+    "          ############ ",
+    "          ###  ####### ",
+    "          ############ ",
+    "          ######       ",
+    "     ##########        ",
+    "   ############        ",
+    "  #############        ",
+    " ###### #######        ",
+    "#######  ####          ",
+    " ######  ####          ",
+    "  ##########           ",
+    "   #######             ",
+    "   ## ####             ",
+    "   ##  ###             ",
+    "   #    #              ",
+]
+
+# --- T-Rex correndo (frame 2) ---
+TREX_RUN2 = [
+    "           ########## ",
+    "          ############ ",
+    "          ###  ####### ",
+    "          ############ ",
+    "          ######       ",
+    "     ##########        ",
+    "   ############        ",
+    "  #############        ",
+    " ###### #######        ",
+    "#######  ####          ",
+    " ######  ####          ",
+    "  ##########           ",
+    "   #######             ",
+    "   ####  ##            ",
+    "   ###   ##            ",
+    "    #    #             ",
+]
+
+# --- T-Rex abaixado (frame 1) ---
+TREX_DUCK1 = [
+    "                       ",
+    "                       ",
+    "                       ",
+    "                       ",
+    "     ##########        ",
+    "     ######   ###      ",
+    "  ## ########  ###     ",
+    "  #############        ",
+    "  #############        ",
+    "  ############         ",
+    "  #########            ",
+    "  ##   ###             ",
+    "  ##    ##             ",
+    "  #      #             ",
+]
+
+# --- T-Rex abaixado (frame 2) ---
+TREX_DUCK2 = [
+    "                       ",
+    "                       ",
+    "                       ",
+    "                       ",
+    "     ##########        ",
+    "     ######   ###      ",
+    "  ## ########  ###     ",
+    "  #############        ",
+    "  #############        ",
+    "  ############         ",
+    "  #########            ",
+    "  ###  ###             ",
+    "   #   ##              ",
+    "        #              ",
+]
+
+# --- T-Rex morto (olho X) ---
+TREX_DEAD = [
+    "           ########## ",
+    "          ############ ",
+    "          ###X ####### ",
+    "          ############ ",
+    "          ######       ",
+    "     ##########        ",
+    "   ############        ",
+    "  #############        ",
+    " ###### #######        ",
+    "#######  ####          ",
+    " ######  ####          ",
+    "  ##########           ",
+    "   #######             ",
+    "   ## ####             ",
+    "   ##  ###             ",
+    "   #    #              ",
+]
+
+# --- Pterodáctilo (asa cima) ---
+PTERO_UP = [
+    "       ##              ",
+    "      ####             ",
+    "  #######              ",
+    " #########             ",
+    "  ######  ##           ",
+    "  ######  ####         ",
+    "  ############ ########",
+    "  ##########################",
+    "   #########           ",
+    "    #######            ",
+    "      ###              ",
+    "       #               ",
+]
+
+# --- Pterodáctilo (asa baixo) ---
+PTERO_DOWN = [
+    "       ##              ",
+    "      ####             ",
+    "  #######              ",
+    " #########             ",
+    "  ######  ##           ",
+    "  ######  ####         ",
+    "  ############ ########",
+    "  ##########################",
+    "   ##   ####           ",
+    "    ##   ###           ",
+    "     ##   ##           ",
+    "          #            ",
+]
+
+# --- Cacto pequeno ---
+CACTUS_SM = [
+    "    ###    ",
+    "    ###    ",
+    "    ###    ",
+    " ## ###    ",
+    " ## ###    ",
+    " #######   ",
+    "    ###    ",
+    "    ###    ",
+    "    ###    ",
+    "    ###    ",
+    "    ###    ",
+    "    ###    ",
+    "    ###    ",
+]
+
+# --- Cacto médio ---
+CACTUS_MD = [
+    "    ###         ",
+    "    ###         ",
+    " ## ###         ",
+    " ## ###  ##     ",
+    " ## ###  ##     ",
+    " ########       ",
+    "    ###         ",
+    "    ###         ",
+    "    ###  ##     ",
+    "    ########    ",
+    "    ###    ##   ",
+    "    ###         ",
+    "    ###         ",
+    "    ###         ",
+]
+
+# --- Cacto grande (duplo) ---
+CACTUS_LG = [
+    "    ###    ###  ",
+    "    ###    ###  ",
+    " ## ###    ###  ",
+    " ## ###    ### ##",
+    " ## ###    ### ##",
+    " #######   #####",
+    "    ###    ###  ",
+    "    ###    ###  ",
+    "    ###    ###  ",
+    " ## #####  ###  ",
+    " ########  ###  ",
+    "    ###    ###  ",
+    "    ###    ###  ",
+    "    ###    ###  ",
+]
+
+CACTUS_SPRITES = [CACTUS_SM, CACTUS_MD, CACTUS_LG]
+
+# --- Nuvem ---
+CLOUD_SPRITE = [
+    "  ###    ",
+    " ######  ",
+    "#########",
+    "#########",
+    "#########",
+]
+
+
+def draw_sprite(surface, sprite, x, y, color, scale=P):
+    """
+    Desenha um sprite pixel-art na superfície.
+
+    Args:
+        surface: Superfície Pygame.
+        sprite:  Lista de strings com '#' = pixel preenchido.
+        x, y:   Posição do canto superior esquerdo (pixels reais).
+        color:  Cor dos pixels preenchidos.
+        scale:  Tamanho de cada "pixel" do sprite em pixels reais.
+    """
+    for row_i, row in enumerate(sprite):
+        for col_i, ch in enumerate(row):
+            if ch == '#':
+                pygame.draw.rect(
+                    surface, color,
+                    (x + col_i * scale, y + row_i * scale, scale, scale)
+                )
+            elif ch == 'X':
+                # Olho de morto — 'X' branco sobre o cinza
+                ex = x + col_i * scale
+                ey = y + row_i * scale
+                pygame.draw.line(surface, BG_COLOR,
+                                 (ex, ey), (ex + scale - 1, ey + scale - 1),
+                                 max(1, scale // 2))
+                pygame.draw.line(surface, BG_COLOR,
+                                 (ex + scale - 1, ey), (ex, ey + scale - 1),
+                                 max(1, scale // 2))
+
+
+def sprite_size(sprite, scale=P):
+    """Retorna (largura, altura) em pixels reais de um sprite."""
+    h = len(sprite)
+    w = max(len(row) for row in sprite)
+    return w * scale, h * scale
+
+
+# ╔═══════════════════════════════════════════════════════════════╗
+# ║                    CLASSE: Dino                              ║
+# ╚═══════════════════════════════════════════════════════════════╝
+
+class Dino:
+    """
+    Representa um dinossauro no jogo.
+    O hitbox é baseado nas dimensões do sprite pixel-art com margem interna.
+    """
+
+    def __init__(self, x: int, color: tuple, name: str = "Dino"):
+        self.x    = x
+        self.color = color
+        self.name = name
+        self.reset()
+
+    def reset(self):
+        """Retorna ao estado inicial (em pé, no chão)."""
+        self.vel_y      = 0.0
+        self.is_jumping = False
+        self.is_ducking = False
+        self.alive      = True
+        self.score      = 0
+        self._anim      = 0
+        self.width      = DINO_W
+        self.height     = DINO_H
+        self.y          = GROUND_Y - self.height
+
+    def jump(self):
+        """Inicia pulo se estiver no chão."""
+        if not self.is_jumping:
+            self.vel_y      = JUMP_VELOCITY
+            self.is_jumping = True
+            self.is_ducking = False
+            self.width      = DINO_W
+            self.height     = DINO_H
+
+    def duck(self):
+        """Abaixa o dino."""
+        if not self.is_jumping:
+            self.is_ducking = True
+            self.width      = DINO_DUCK_W
+            self.height     = DINO_DUCK_H
+            self.y          = GROUND_Y - self.height
+
+    def stand(self):
+        """Sai do estado abaixado."""
+        if self.is_ducking:
+            self.is_ducking = False
+            self.width      = DINO_W
+            self.height     = DINO_H
+            self.y          = GROUND_Y - self.height
+
+    def update(self):
+        """Aplica física de gravidade."""
+        if self.is_jumping or self.y < GROUND_Y - self.height:
+            self.vel_y += GRAVITY
+            self.y     += self.vel_y
+            if self.y >= GROUND_Y - self.height:
+                self.y          = GROUND_Y - self.height
+                self.vel_y      = 0.0
+                self.is_jumping = False
+        self._anim += 1
+
+    def get_rect(self) -> pygame.Rect:
+        """Retorna hitbox com margem interna para ser mais justo."""
+        m = P * 2
+        return pygame.Rect(
+            int(self.x) + m,
+            int(self.y) + m,
+            self.width  - m * 2,
+            self.height - m * 2,
+        )
+
+    def draw(self, surface: pygame.Surface, dead: bool = False, alpha: int = 255):
+        """
+        Desenha o dino com o sprite pixel-art correto para o estado atual.
+
+        Args:
+            surface: Superfície Pygame.
+            dead:    Se True, usa o sprite de morto.
+            alpha:   Opacidade (255 = sólido; menor = translúcido para modo versus).
+        """
+        x, y = int(self.x), int(self.y)
+
+        if dead:
+            sprite = TREX_DEAD
+        elif self.is_ducking:
+            sprite = TREX_DUCK1 if (self._anim // 8) % 2 == 0 else TREX_DUCK2
+        else:
+            sprite = TREX_RUN1 if (self._anim // 8) % 2 == 0 else TREX_RUN2
+
+        if alpha < 255:
+            sw, sh = sprite_size(sprite)
+            tmp = pygame.Surface((sw, sh), pygame.SRCALPHA)
+            tmp.fill((0, 0, 0, 0))
+            draw_sprite(tmp, sprite, 0, 0, (*self.color, alpha))
+            surface.blit(tmp, (x, y))
+        else:
+            draw_sprite(surface, sprite, x, y, self.color)
+
+
+# ╔═══════════════════════════════════════════════════════════════╗
+# ║                   CLASSE: Obstacle                           ║
+# ╚═══════════════════════════════════════════════════════════════╝
+
+class Obstacle:
+    """
+    Obstáculo: cacto (chão) ou pterodáctilo (ar).
+    Usa sprite pixel-art fiel ao original.
+    """
+
+    def __init__(self, x: float, game_speed: float):
+        self.x    = x
+        self._anim = 0
+
+        if random.random() < 0.28 and game_speed > 10.0:
+            self.type      = "bird"
+            self._sprite_a = PTERO_UP
+            self._sprite_b = PTERO_DOWN
+            w, h           = sprite_size(PTERO_UP)
+            self.width     = w
+            self.height    = h
+            self.y         = random.choice(BIRD_Y_OPTIONS) - h
+        else:
+            self.type      = "cactus"
+            self._sprite_a = random.choice(CACTUS_SPRITES)
+            self._sprite_b = self._sprite_a
+            w, h           = sprite_size(self._sprite_a)
+            self.width     = w
+            self.height    = h
+            self.y         = GROUND_Y - h
+
+    def update(self, speed: float):
+        self.x    -= speed
+        self._anim += 1
+
+    def get_rect(self) -> pygame.Rect:
+        m = P
+        return pygame.Rect(
+            int(self.x) + m,
+            int(self.y) + m,
+            self.width  - m * 2,
+            self.height - m * 2,
+        )
+
+    def draw(self, surface: pygame.Surface):
+        sprite = self._sprite_a if (self._anim // 10) % 2 == 0 else self._sprite_b
+        draw_sprite(surface, sprite, int(self.x), int(self.y), OBSTACLE_COLOR)
+
+    def is_off_screen(self) -> bool:
+        return self.x + self.width + 10 < 0
+
+
+# ╔═══════════════════════════════════════════════════════════════╗
+# ║                     CLASSE: Cloud                            ║
+# ╚═══════════════════════════════════════════════════════════════╝
+
+class Cloud:
+    """Nuvem decorativa em estilo pixelado, igual ao original."""
+
+    def __init__(self):
+        self.x     = SCREEN_WIDTH + random.randint(20, 250)
+        self.y     = random.randint(20, 100)
+        self.speed = random.uniform(0.5, 1.2)
+        self.scale = random.choice([2, 3])
+
+    def update(self):
+        self.x -= self.speed
+
+    def draw(self, surface: pygame.Surface):
+        draw_sprite(surface, CLOUD_SPRITE, int(self.x), self.y, CLOUD_COLOR, self.scale)
+
+    def is_off_screen(self) -> bool:
+        w, _ = sprite_size(CLOUD_SPRITE, self.scale)
+        return self.x + w < 0
+
+
+# ╔═══════════════════════════════════════════════════════════════╗
+# ║                 CLASSE PRINCIPAL: DinoGame                   ║
+# ╚═══════════════════════════════════════════════════════════════╝
+
+class DinoGame:
+    """
+    Ambiente do Jogo do Dinossauro — compatível com Reinforcement Learning.
+
+    ┌─────────────────────────────────────────────────────────────┐
+    │  MODO 1 — TREINAMENTO RL (sem renderização, alta velocidade)│
+    │                                                             │
+    │    env = DinoGame(render=False)                             │
+    │    state = env.reset()                                      │
+    │    while True:                                              │
+    │        action = agent.predict(state)  # ← PLUGAR IA AQUI  │
+    │        state, reward, done, score = env.play_step(action)   │
+    │        if done:                                             │
+    │            state = env.reset()                              │
+    │                                                             │
+    │  MODO 2 — DUELO HUMANO vs IA (renderização 60 FPS)         │
+    │                                                             │
+    │    env = DinoGame(render=True)                              │
+    │    env.play_versus_mode(minha_ia)  # ← PLUGAR IA AQUI     │
+    └─────────────────────────────────────────────────────────────┘
+
+    Estado retornado — tupla de 8 floats normalizados [0.0, 1.0]:
+        0: dist_obst   — distância horizontal ao obstáculo mais próximo
+        1: height_obst — posição Y do obstáculo (menor = mais alto)
+        2: width_obst  — largura do obstáculo
+        3: speed       — velocidade do jogo
+        4: dino_y      — posição Y do dino
+        5: is_jumping  — 1.0 se pulando
+        6: is_ducking  — 1.0 se abaixado
+        7: obst_type   — 0.0 cacto / 1.0 pássaro
+
+    Ações: 0 = Correr, 1 = Pular, 2 = Abaixar
+    """
+
+    def __init__(self, render: bool = True):
+        self.render_game = render
+        self.display     = None
+        self.clock       = None
+        self.font        = None
+        self.font_big    = None
+
+        if self.render_game:
+            pygame.init()
+            self.display = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
+            pygame.display.set_caption("Dino Game")
+            self.clock   = pygame.time.Clock()
+            self._init_fonts()
+
+        self.dino        = Dino(x=80, color=DINO_COLOR, name="Player")
+        self.obstacles   = []
+        self.clouds      = []
+        self.game_speed  = INITIAL_SPEED
+        self.score       = 0
+        self.hi_score    = 0
+        self.frame_count = 0
+        self.game_over   = False
+
+        self._ground_dots = self._gen_ground_dots()
+
+    def _init_fonts(self):
+        candidates = ["courier new", "consolas", "lucida console", "monospace"]
+        f = None
+        for name in candidates:
+            try:
+                f = pygame.font.SysFont(name, 18, bold=True)
+                break
+            except Exception:
+                pass
+        self.font     = f or pygame.font.Font(None, 22)
+        self.font_big = pygame.font.SysFont(candidates[0], 28, bold=True) \
+                        if f else pygame.font.Font(None, 34)
+
+    @staticmethod
+    def _gen_ground_dots():
+        rng  = random.Random(42)
+        dots = []
+        for _ in range(120):
+            x      = rng.randint(0, SCREEN_WIDTH * 3)
+            length = rng.randint(2, 10)
+            dots.append((x, length))
+        return dots
+
+    # ────────────────────────────────────────────────────────
+    #  INTERFACE RL: reset() e play_step(action)
+    # ────────────────────────────────────────────────────────
+
+    def reset(self) -> tuple:
+        """
+        Reseta o jogo ao estado inicial.
+        Returns: state (tuple de 8 floats normalizados).
+        """
+        self.dino.reset()
+        self.obstacles.clear()
+        self.clouds.clear()
+        self.game_speed  = INITIAL_SPEED
+        self.score       = 0
+        self.frame_count = 0
+        self.game_over   = False
+        self._spawn_obstacle()
+        return self._get_state()
+
+    def play_step(self, action: int) -> tuple:
+        """
+        Executa UM frame do jogo com a ação fornecida.
+
+        ╔═══════════════════════════════════════════════════╗
+        ║  INTERFACE PRINCIPAL PARA REINFORCEMENT LEARNING ║
+        ║  Plugue seu agente aqui para treinar a IA.       ║
+        ╚═══════════════════════════════════════════════════╝
+
+        Args:
+            action: 0 = Correr, 1 = Pular, 2 = Abaixar.
+
+        Returns:
+            (state, reward, game_over, score)
+        """
+        reward = 0.1
+
+        if action == ACTION_JUMP:
+            self.dino.jump()
+        elif action == ACTION_DUCK:
+            self.dino.duck()
+        else:
+            self.dino.stand()
+
+        self.dino.update()
+
+        for obs in self.obstacles:
+            obs.update(self.game_speed)
+
+        new_obs = []
+        for obs in self.obstacles:
+            if obs.is_off_screen():
+                reward += 1.5
+            else:
+                new_obs.append(obs)
+        self.obstacles = new_obs
+
+        self._maybe_spawn_obstacle()
+        self.game_speed = min(MAX_SPEED, self.game_speed + SPEED_INCREMENT)
+
+        done = self._check_collision(self.dino)
+        if done:
+            reward     = -10.0
+            self.game_over = True
+
+        self.frame_count += 1
+        self.score        = self.frame_count // 6
+        if self.score > self.hi_score:
+            self.hi_score = self.score
+
+        if self.render_game:
+            self._render_solo()
+            if self.clock:
+                self.clock.tick(FPS)
+
+        return self._get_state(), reward, done, self.score
+
+    # ────────────────────────────────────────────────────────
+    #  OBSERVAÇÃO / ESTADO
+    # ────────────────────────────────────────────────────────
+
+    def _get_state(self, dino=None) -> tuple:
+        """
+        Calcula o vetor de estado (observação) para o agente RL.
+
+        ╔═══════════════════════════════════════════════════════╗
+        ║  MODIFIQUE AQUI para experimentar diferentes         ║
+        ║  representações de estado para seu agente RL.        ║
+        ╚═══════════════════════════════════════════════════════╝
+        """
+        if dino is None:
+            dino = self.dino
+
+        nearest  = None
+        min_dist = float('inf')
+        for obs in self.obstacles:
+            dist = obs.x - dino.x
+            if dist > -obs.width and dist < min_dist:
+                min_dist = dist
+                nearest  = obs
+
+        if nearest is not None:
+            dist_n   = max(0.0, (nearest.x - dino.x) / SCREEN_WIDTH)
+            height_n = nearest.y / SCREEN_HEIGHT
+            width_n  = nearest.width / (40 * P)
+            type_n   = 1.0 if nearest.type == "bird" else 0.0
+        else:
+            dist_n, height_n, width_n, type_n = 1.0, 1.0, 0.0, 0.0
+
+        return (
+            dist_n,
+            height_n,
+            width_n,
+            self.game_speed / MAX_SPEED,
+            dino.y / SCREEN_HEIGHT,
+            1.0 if dino.is_jumping else 0.0,
+            1.0 if dino.is_ducking else 0.0,
+            type_n,
+        )
+
+    # ────────────────────────────────────────────────────────
+    #  LÓGICA INTERNA
+    # ────────────────────────────────────────────────────────
+
+    def _maybe_spawn_obstacle(self):
+        if not self.obstacles:
+            self._spawn_obstacle()
+            return
+        rightmost = max(self.obstacles, key=lambda o: o.x)
+        gap = random.randint(MIN_OBSTACLE_GAP, MAX_OBSTACLE_GAP)
+        if SCREEN_WIDTH - rightmost.x >= gap:
+            self._spawn_obstacle()
+
+    def _spawn_obstacle(self):
+        x = SCREEN_WIDTH + random.randint(20, 120)
+        self.obstacles.append(Obstacle(x, self.game_speed))
+
+    def _check_collision(self, dino) -> bool:
+        dr = dino.get_rect()
+        for obs in self.obstacles:
+            if dr.colliderect(obs.get_rect()):
+                return True
+        return False
+
+    # ────────────────────────────────────────────────────────
+    #  RENDERIZAÇÃO
+    # ────────────────────────────────────────────────────────
+
+    def _draw_ground(self):
+        """Linha do chão + pontinhos no estilo original."""
+        pygame.draw.line(self.display, GROUND_COLOR,
+                         (0, GROUND_Y), (SCREEN_WIDTH, GROUND_Y), 2)
+        scroll = int(self.frame_count * self.game_speed * 0.6) % (SCREEN_WIDTH * 3)
+        for (bx, length) in self._ground_dots:
+            x = (bx - scroll) % (SCREEN_WIDTH * 3) - SCREEN_WIDTH // 2
+            if 0 <= x <= SCREEN_WIDTH:
+                pygame.draw.line(self.display, CLOUD_COLOR,
+                                 (x, GROUND_Y + 5), (x + length, GROUND_Y + 5), 1)
+                pygame.draw.line(self.display, CLOUD_COLOR,
+                                 (x + 2, GROUND_Y + 9), (x + length - 2, GROUND_Y + 9), 1)
+
+    def _update_clouds(self):
+        if self.frame_count % 150 == 0 and len(self.clouds) < 6:
+            self.clouds.append(Cloud())
+        for c in self.clouds:
+            c.update()
+        self.clouds = [c for c in self.clouds if not c.is_off_screen()]
+
+    def _draw_hud(self, score: int, hi: int = None):
+        """HUD no estilo original: 'HI XXXXX  XXXXX'."""
+        if hi is None:
+            hi = self.hi_score
+        label = f"HI {str(hi).zfill(5)}  {str(score).zfill(5)}"
+        surf  = self.font.render(label, True, TEXT_COLOR)
+        self.display.blit(surf, (SCREEN_WIDTH - surf.get_width() - 16, 12))
+
+    def _draw_game_over_screen(self, surface):
+        """Tela de Game Over fiel ao original."""
+        # "GAME OVER" com letras espaçadas
+        go_surf = self.font_big.render("G A M E   O V E R", True, TEXT_COLOR)
+        go_rect = go_surf.get_rect(center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2 - 35))
+        surface.blit(go_surf, go_rect)
+
+        # Botão de restart (quadrado cinza com seta branca)
+        btn_cx, btn_cy, btn_r = SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2 + 18, 18
+        pygame.draw.rect(surface, TEXT_COLOR,
+                         (btn_cx - btn_r - 2, btn_cy - btn_r - 2,
+                          (btn_r + 2) * 2, (btn_r + 2) * 2), border_radius=4)
+        arrow = [(btn_cx - 7, btn_cy - 9),
+                 (btn_cx - 7, btn_cy + 9),
+                 (btn_cx + 10, btn_cy)]
+        pygame.draw.polygon(surface, BG_COLOR, arrow)
+
+    def _render_solo(self):
+        """Renderiza um frame do modo solo."""
+        if self.display is None:
+            return
+
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                pygame.quit()
+                sys.exit()
+            if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+                pygame.quit()
+                sys.exit()
+
+        self.display.fill(BG_COLOR)
+        self._update_clouds()
+        for c in self.clouds:
+            c.draw(self.display)
+        self._draw_ground()
+        for obs in self.obstacles:
+            obs.draw(self.display)
+        self.dino.draw(self.display)
+        self._draw_hud(self.score)
+        pygame.display.flip()
+
+    # ╔═══════════════════════════════════════════════════════════╗
+    # ║         MODO DUELO — HUMANO VS IA                        ║
+    # ╚═══════════════════════════════════════════════════════════╝
+
+    def play_versus_mode(self, ai_predict_function):
+        """
+        Modo Duelo: Humano (cinza) vs IA (azul), renderizado a 60 FPS.
+
+        ╔═══════════════════════════════════════════════════════════╗
+        ║  COMO PLUGAR SUA IA TREINADA:                            ║
+        ║                                                          ║
+        ║    def minha_ia(state):                                  ║
+        ║        # state = tupla de 8 floats normalizados          ║
+        ║        # Retorne: 0 (nada), 1 (pular), 2 (abaixar)      ║
+        ║        return modelo.predict(state)                      ║
+        ║                                                          ║
+        ║    env = DinoGame(render=True)                           ║
+        ║    env.play_versus_mode(minha_ia)                        ║
+        ╚═══════════════════════════════════════════════════════════╝
+
+        Controles:
+            ESPAÇO / ↑  → Pular
+            ↓           → Abaixar
+            R           → Reiniciar
+            ESC         → Sair
+        """
+        if not self.render_game:
+            print("ERRO: Modo versus requer DinoGame(render=True)")
+            return
+
+        pygame.init()
+        if self.display is None:
+            self.display = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
+        pygame.display.set_caption("Dino Game — Humano vs IA")
+        if self.clock is None:
+            self.clock = pygame.time.Clock()
+        self._init_fonts()
+
+        player  = Dino(x=60,  color=PLAYER_COLOR, name="Humano")
+        ai_dino = Dino(x=120, color=AI_COLOR,     name="IA")
+
+        def _reset_round():
+            player.reset()
+            ai_dino.reset()
+            self.obstacles.clear()
+            self.clouds.clear()
+            self.game_speed  = INITIAL_SPEED
+            self.score       = 0
+            self.frame_count = 0
+            self.game_over   = False
+            self._spawn_obstacle()
+            return None, {}, False
+
+        winner, death_scores, round_over = _reset_round()
+        running = True
+
+        while running:
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    running = False
+                if event.type == pygame.KEYDOWN:
+                    if event.key == pygame.K_ESCAPE:
+                        running = False
+                    if round_over and event.key == pygame.K_r:
+                        winner, death_scores, round_over = _reset_round()
+
+            if not running:
+                break
+            if round_over:
+                self.clock.tick(FPS)
+                continue
+
+            # ── Input Humano ──
+            keys = pygame.key.get_pressed()
+            if player.alive:
+                if keys[pygame.K_SPACE] or keys[pygame.K_UP]:
+                    player.jump()
+                elif keys[pygame.K_DOWN]:
+                    player.duck()
+                else:
+                    player.stand()
+                player.update()
+
+            # ── Decisão da IA ──
+            if ai_dino.alive:
+                # ╔═══════════════════════════════════════╗
+                # ║  >>> A IA DECIDE A AÇÃO AQUI <<<      ║
+                # ╚═══════════════════════════════════════╝
+                ai_state  = self._get_state(ai_dino)
+                ai_action = ai_predict_function(ai_state)
+
+                if ai_action == ACTION_JUMP:
+                    ai_dino.jump()
+                elif ai_action == ACTION_DUCK:
+                    ai_dino.duck()
+                else:
+                    ai_dino.stand()
+                ai_dino.update()
+
+            # ── Mundo ──
+            for obs in self.obstacles:
+                obs.update(self.game_speed)
+            self.obstacles  = [o for o in self.obstacles if not o.is_off_screen()]
+            self._maybe_spawn_obstacle()
+            self._update_clouds()
+            self.game_speed = min(MAX_SPEED, self.game_speed + SPEED_INCREMENT)
+
+            # ── Colisões ──
+            if player.alive and self._check_collision(player):
+                player.alive      = False
+                player.y          = GROUND_Y - player.height
+                player.is_jumping = False
+                player.vel_y      = 0
+                death_scores["Humano"] = self.score
+
+            if ai_dino.alive and self._check_collision(ai_dino):
+                ai_dino.alive      = False
+                ai_dino.y          = GROUND_Y - ai_dino.height
+                ai_dino.is_jumping = False
+                ai_dino.vel_y      = 0
+                death_scores["IA"] = self.score
+
+            # ── Score ──
+            self.frame_count += 1
+            self.score        = self.frame_count // 6
+            if self.score > self.hi_score:
+                self.hi_score = self.score
+
+            # ── Fim de Rodada? ──
+            if not player.alive and not ai_dino.alive:
+                ps  = death_scores.get("Humano", 0)
+                ais = death_scores.get("IA", 0)
+                winner     = "Humano" if ps > ais else ("IA" if ais > ps else "Empate")
+                round_over = True
+
+            # ── Renderizar ──
+            self.display.fill(BG_COLOR)
+
+            for c in self.clouds:
+                c.draw(self.display)
+            self._draw_ground()
+            for obs in self.obstacles:
+                obs.draw(self.display)
+
+            # Mortos primeiro (translúcidos), vivos por cima
+            if not ai_dino.alive:
+                ai_dino.draw(self.display, dead=True, alpha=60)
+            if not player.alive:
+                player.draw(self.display, dead=True, alpha=60)
+            if ai_dino.alive:
+                ai_dino.draw(self.display)
+            if player.alive:
+                player.draw(self.display)
+
+            # HUD
+            self._draw_hud(self.score)
+
+            # Etiquetas dos dinos
+            p_lbl  = self.font.render("JOGADOR", True, PLAYER_COLOR)
+            ai_lbl = self.font.render("IA",      True, AI_COLOR)
+            self.display.blit(p_lbl,  (12, 12))
+            self.display.blit(ai_lbl, (12, 34))
+
+            # Tela de resultado
+            if round_over:
+                overlay = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.SRCALPHA)
+                overlay.fill((247, 247, 247, 200))
+                self.display.blit(overlay, (0, 0))
+
+                go_surf = self.font_big.render("G A M E   O V E R", True, TEXT_COLOR)
+                self.display.blit(go_surf, go_surf.get_rect(
+                    center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2 - 60)))
+
+                if winner == "Humano":
+                    res_text, res_color = "JOGADOR VENCEU!", (39, 174, 96)
+                elif winner == "IA":
+                    res_text, res_color = "IA VENCEU!", (41, 128, 185)
+                else:
+                    res_text, res_color = "EMPATE!", (150, 100, 20)
+
+                res_surf = self.font_big.render(res_text, True, res_color)
+                self.display.blit(res_surf, res_surf.get_rect(
+                    center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2 - 15)))
+
+                ps_f  = death_scores.get("Humano", 0)
+                ais_f = death_scores.get("IA", 0)
+                sc_surf = self.font.render(
+                    f"Jogador: {str(ps_f).zfill(5)}   IA: {str(ais_f).zfill(5)}", True, TEXT_COLOR)
+                self.display.blit(sc_surf, sc_surf.get_rect(
+                    center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2 + 25)))
+
+                hint = self.font.render("[R] REINICIAR   [ESC] SAIR", True, CLOUD_COLOR)
+                self.display.blit(hint, hint.get_rect(
+                    center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2 + 60)))
+
+            pygame.display.flip()
+            self.clock.tick(FPS)
+
+        pygame.quit()
+
+    # ╔═══════════════════════════════════════════════════════════╗
+    # ║         MODO POPULAÇÃO — N AGENTES SIMULTÂNEOS           ║
+    # ╚═══════════════════════════════════════════════════════════╝
+
+    def play_population_mode(
+        self,
+        ai_list: list,
+        generation: int = 1,
+        labels: list = None,
+    ):
+        """
+        Modo de treinamento visual com N dinos simultâneos, cada um
+        com uma cor única gerada automaticamente.
+
+        ╔══════════════════════════════════════════════════════════╗
+        ║  COMO USAR COM NEAT / DQN / QUALQUER ALGORITMO RL:      ║
+        ║                                                          ║
+        ║  # NEAT — passe uma lista de funções de decisão:        ║
+        ║  def make_predict(net):                                  ║
+        ║      def fn(state):                                      ║
+        ║          out = net.activate(state)                       ║
+        ║          return out.index(max(out))   # 0, 1 ou 2       ║
+        ║      return fn                                           ║
+        ║                                                          ║
+        ║  env = DinoGame(render=True)                             ║
+        ║  fns = [make_predict(net) for net in neat_population]    ║
+        ║  env.play_population_mode(fns, generation=gen_num)       ║
+        ║                                                          ║
+        ║  # DQN — todos usam o mesmo modelo, mas estados únicos:  ║
+        ║  fns = [lambda s: dqn_model.predict(s)] * 100            ║
+        ║  env.play_population_mode(fns)                           ║
+        ╚══════════════════════════════════════════════════════════╝
+
+        Cada agente em ai_list recebe o estado do SEU dino e retorna
+        uma ação (0 = correr, 1 = pular, 2 = abaixar).
+
+        Cores são geradas automaticamente via HSV para N agentes.
+        Dinos mortos ficam translúcidos (alpha 25) mas permanecem
+        visíveis para acompanhar onde caíram.
+
+        O jogo termina quando TODOS os dinos morrerem.
+        Pressione R para reiniciar, ESC para sair.
+
+        Args:
+            ai_list:    Lista de N callables. Cada um recebe state (tuple
+                        de 8 floats) e retorna action (int 0/1/2).
+                        ╔══════════════════════════════════════╗
+                        ║  >>> PONTO DE INTEGRAÇÃO DA IA <<<  ║
+                        ╚══════════════════════════════════════╝
+            generation: Número da geração (exibido no HUD).
+            labels:     Lista opcional de strings para nomear cada dino
+                        (tamanho deve ser igual a len(ai_list)).
+
+        Returns:
+            dict com chaves:
+                'scores'       — lista de scores de cada agente
+                'best_score'   — melhor score da geração
+                'alive_frames' — quantos frames cada dino sobreviveu
+        """
+        n = len(ai_list)
+        if n == 0:
+            return {"scores": [], "best_score": 0, "alive_frames": []}
+
+        if not self.render_game:
+            print("ERRO: play_population_mode requer DinoGame(render=True)")
+            return {}
+
+        pygame.init()
+        if self.display is None:
+            self.display = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
+        pygame.display.set_caption(f"Dino Game — Populacao ({n} agentes)")
+        if self.clock is None:
+            self.clock = pygame.time.Clock()
+        self._init_fonts()
+
+        # ── Gerar cores distintas para cada agente ──────────────────
+        colors = generate_distinct_colors(n)
+        if labels is None:
+            labels = [f"#{i}" for i in range(n)]
+
+        # ── Criar todos os dinos na mesma posição X ──────────────────
+        # Todos começam empilhados; a diferença de cor os identifica
+        dinos = [
+            Dino(x=80, color=colors[i], name=labels[i])
+            for i in range(n)
+        ]
+
+        # Estatísticas por agente
+        alive_frames = [0] * n     # Frames que cada agente sobreviveu
+        final_scores = [0] * n     # Score final de cada agente
+
+        # Reiniciar estado do mundo
+        self.obstacles.clear()
+        self.clouds.clear()
+        self.game_speed  = INITIAL_SPEED
+        self.score       = 0
+        self.frame_count = 0
+        self.game_over   = False
+        self._spawn_obstacle()
+
+        round_over = False
+        running    = True
+
+        while running:
+            # ── Eventos ──────────────────────────────────────────────
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    running = False
+                if event.type == pygame.KEYDOWN:
+                    if event.key == pygame.K_ESCAPE:
+                        running = False
+                    if round_over and event.key == pygame.K_r:
+                        # Reiniciar para nova rodada com os mesmos agentes
+                        for d in dinos:
+                            d.reset()
+                            d.color = colors[dinos.index(d)]  # Restaurar cor
+                        alive_frames = [0] * n
+                        final_scores = [0] * n
+                        self.obstacles.clear()
+                        self.clouds.clear()
+                        self.game_speed  = INITIAL_SPEED
+                        self.score       = 0
+                        self.frame_count = 0
+                        round_over       = False
+                        self._spawn_obstacle()
+
+            if not running:
+                break
+            if round_over:
+                self.clock.tick(FPS)
+                continue
+
+            # ── Decisão de cada agente vivo ──────────────────────────
+            for i, dino in enumerate(dinos):
+                if not dino.alive:
+                    continue
+
+                # ╔═══════════════════════════════════════════════╗
+                # ║  >>> CADA IA DECIDE SUA AÇÃO AQUI <<<        ║
+                # ║  ai_list[i] é a função do agente i           ║
+                # ║  Recebe state específico do dino i           ║
+                # ╚═══════════════════════════════════════════════╝
+                state  = self._get_state(dino)
+                action = ai_list[i](state)
+
+                if action == ACTION_JUMP:
+                    dino.jump()
+                elif action == ACTION_DUCK:
+                    dino.duck()
+                else:
+                    dino.stand()
+
+                dino.update()
+                alive_frames[i] += 1
+
+            # ── Atualizar mundo ──────────────────────────────────────
+            for obs in self.obstacles:
+                obs.update(self.game_speed)
+            self.obstacles  = [o for o in self.obstacles if not o.is_off_screen()]
+            self._maybe_spawn_obstacle()
+            self._update_clouds()
+            self.game_speed = min(MAX_SPEED, self.game_speed + SPEED_INCREMENT)
+
+            # ── Colisões ─────────────────────────────────────────────
+            for i, dino in enumerate(dinos):
+                if dino.alive and self._check_collision(dino):
+                    dino.alive      = False
+                    dino.y          = GROUND_Y - dino.height
+                    dino.is_jumping = False
+                    dino.vel_y      = 0
+                    final_scores[i] = self.score
+
+            # ── Score ────────────────────────────────────────────────
+            self.frame_count += 1
+            self.score        = self.frame_count // 6
+            if self.score > self.hi_score:
+                self.hi_score = self.score
+
+            # Contagem de vivos
+            n_alive = sum(1 for d in dinos if d.alive)
+
+            # ── Todos morreram? ──────────────────────────────────────
+            if n_alive == 0:
+                # Preencher scores dos últimos sobreviventes
+                for i, d in enumerate(dinos):
+                    if final_scores[i] == 0:
+                        final_scores[i] = self.score
+                round_over = True
+
+            # ── Renderizar ───────────────────────────────────────────
+            self.display.fill(BG_COLOR)
+
+            for c in self.clouds:
+                c.draw(self.display)
+            self._draw_ground()
+            for obs in self.obstacles:
+                obs.draw(self.display)
+
+            # Dinos mortos (muito translúcidos, desenhados primeiro)
+            for dino in dinos:
+                if not dino.alive:
+                    dino.draw(self.display, dead=True, alpha=25)
+
+            # Dinos vivos (sólidos, por cima)
+            for dino in dinos:
+                if dino.alive:
+                    dino.draw(self.display)
+
+            # ── HUD ──────────────────────────────────────────────────
+            self._draw_hud(self.score)
+
+            # Info da geração e contagem de vivos
+            gen_surf   = self.font.render(
+                f"GER {generation:>3d}   VIVOS {n_alive:>3d}/{n}", True, TEXT_COLOR)
+            speed_surf = self.font.render(
+                f"VEL {self.game_speed:.1f}", True, CLOUD_COLOR)
+            self.display.blit(gen_surf,   (12, 12))
+            self.display.blit(speed_surf, (12, 34))
+
+            # Legenda de cores (até 10 agentes visíveis na legenda)
+            # Para populações grandes, mostra só resumo numérico
+            if n <= 10:
+                for i, (dino, color) in enumerate(zip(dinos, colors)):
+                    status = "VIVO" if dino.alive else f"{final_scores[i]}pt"
+                    lbl_col = color if dino.alive else CLOUD_COLOR
+                    pygame.draw.rect(self.display, color,
+                                     (12, 58 + i * 18, 10, 10),
+                                     border_radius=2)
+                    lbl = self.font.render(f" {labels[i]}  {status}", True, lbl_col)
+                    self.display.blit(lbl, (24, 56 + i * 18))
+
+            # Tela de fim de geração
+            if round_over:
+                overlay = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.SRCALPHA)
+                overlay.fill((247, 247, 247, 210))
+                self.display.blit(overlay, (0, 0))
+
+                # Título
+                go_surf = self.font_big.render(
+                    f"GERACAO {generation} CONCLUIDA", True, TEXT_COLOR)
+                self.display.blit(go_surf, go_surf.get_rect(
+                    center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2 - 65)))
+
+                # Melhor score
+                best_i     = final_scores.index(max(final_scores))
+                best_score = final_scores[best_i]
+                best_surf  = self.font_big.render(
+                    f"MELHOR: {str(best_score).zfill(5)}  (Agente {labels[best_i]})",
+                    True, colors[best_i])
+                self.display.blit(best_surf, best_surf.get_rect(
+                    center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2 - 20)))
+
+                # Médias
+                avg = sum(final_scores) / len(final_scores)
+                stats_surf = self.font.render(
+                    f"Media: {avg:.1f}   Total: {n} agentes", True, TEXT_COLOR)
+                self.display.blit(stats_surf, stats_surf.get_rect(
+                    center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2 + 20)))
+
+                hint = self.font.render(
+                    "[R] NOVA RODADA   [ESC] SAIR", True, CLOUD_COLOR)
+                self.display.blit(hint, hint.get_rect(
+                    center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2 + 55)))
+
+            pygame.display.flip()
+            self.clock.tick(FPS)
+
+        pygame.quit()
+
+        return {
+            "scores":       final_scores,
+            "best_score":   max(final_scores) if final_scores else 0,
+            "alive_frames": alive_frames,
+        }
+
+
+# ╔═══════════════════════════════════════════════════════════════╗
+# ║                   IA DE DEMONSTRAÇÃO                         ║
+# ╚═══════════════════════════════════════════════════════════════╝
+
+def demo_ai_simple(state: tuple) -> int:
+    """
+    IA de demonstração baseada em regras simples.
+
+    ╔═══════════════════════════════════════════════════════════╗
+    ║  SUBSTITUA ESTA FUNÇÃO PELA SUA IA TREINADA!             ║
+    ║                                                          ║
+    ║  Ela recebe o estado e deve retornar uma ação:           ║
+    ║    0 = não fazer nada                                    ║
+    ║    1 = pular                                             ║
+    ║    2 = abaixar                                           ║
+    ║                                                          ║
+    ║  Exemplo com PyTorch:                                    ║
+    ║    def minha_ia(state):                                  ║
+    ║        tensor = torch.tensor(state, dtype=torch.float32) ║
+    ║        with torch.no_grad():                             ║
+    ║            q_values = modelo(tensor)                     ║
+    ║        return q_values.argmax().item()                   ║
+    ╚═══════════════════════════════════════════════════════════╝
+    """
+    dist      = state[0]
+    height    = state[1]
+    speed     = state[3]
+    is_jump   = state[5]
+    obst_type = state[7]
+
+    if obst_type == 1.0 and height > 0.65 and dist < 0.28:
+        return ACTION_DUCK
+
+    threshold = 0.12 + speed * 0.18
+    if dist < threshold and is_jump < 0.5:
+        return ACTION_JUMP
+
+    return ACTION_NONE
+
+
+# ╔═══════════════════════════════════════════════════════════════╗
+# ║                    PONTO DE ENTRADA                          ║
+# ╚═══════════════════════════════════════════════════════════════╝
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Dino Game — Clone fiel do Jogo do Dinossauro (Python + Pygame)"
+    )
+    parser.add_argument(
+        "--mode",
+        choices=["train", "versus", "play", "population"],
+        default="versus",
+        help="Modo: train (RL) | versus (Humano vs IA) | play (solo) | population (N dinos)"
+    )
+    parser.add_argument("--episodes", type=int, default=5)
+    parser.add_argument("--agents",   type=int, default=50,
+                        help="Numero de agentes para o modo population (padrao: 50)")
+    args = parser.parse_args()
+
+    # ═══════════════════════════════════════════════════
+    #  MODO TREINAMENTO
+    # ═══════════════════════════════════════════════════
+    if args.mode == "train":
+        print("=" * 55)
+        print("  MODO TREINAMENTO — Sem renderização, alta velocidade")
+        print("=" * 55)
+        env = DinoGame(render=False)
+        for ep in range(1, args.episodes + 1):
+            state = env.reset()
+            total_r, steps = 0.0, 0
+            while True:
+                # ╔═════════════════════════════════════╗
+                # ║  >>> PLUGUE SEU AGENTE RL AQUI <<<  ║
+                # ╚═════════════════════════════════════╝
+                action = demo_ai_simple(state)
+                state, reward, done, score = env.play_step(action)
+                total_r += reward
+                steps   += 1
+                if done:
+                    print(f"  Ep {ep:>3d}/{args.episodes}  Score: {score:>5d}  "
+                          f"Reward: {total_r:>8.1f}  Steps: {steps:>6d}")
+                    break
+        print("Concluido!")
+
+    # ═══════════════════════════════════════════════════
+    #  MODO VERSUS
+    # ═══════════════════════════════════════════════════
+    elif args.mode == "versus":
+        print("=" * 55)
+        print("  MODO DUELO: Jogador (cinza) vs IA (azul)")
+        print("  ESPACO/cima Pular  | baixo Abaixar  | R Reiniciar  | ESC Sair")
+        print("=" * 55)
+        env = DinoGame(render=True)
+        # ╔═════════════════════════════════════════════╗
+        # ║  Substitua demo_ai_simple pela sua IA real ║
+        # ╚═════════════════════════════════════════════╝
+        env.play_versus_mode(ai_predict_function=demo_ai_simple)
+
+    # ═══════════════════════════════════════════════════
+    #  MODO POPULAÇÃO
+    # ═══════════════════════════════════════════════════
+    elif args.mode == "population":
+        n = args.agents
+        print("=" * 55)
+        print(f"  MODO POPULACAO: {n} agentes simultaneos")
+        print("  R Reiniciar  |  ESC Sair")
+        print("=" * 55)
+
+        # Cada agente usa a mesma IA de demo — substitua por funções reais
+        # ╔══════════════════════════════════════════════════════════╗
+        # ║  Para NEAT, gere uma função por rede neural:            ║
+        # ║    ai_list = [make_predict(net) for net in population]  ║
+        # ╚══════════════════════════════════════════════════════════╝
+        ai_list = [demo_ai_simple] * n
+
+        env    = DinoGame(render=True)
+        result = env.play_population_mode(
+            ai_list    = ai_list,
+            generation = 1,
+            labels     = [str(i) for i in range(n)],
+        )
+        print(f"  Melhor score: {result['best_score']}")
+        print(f"  Score médio:  {sum(result['scores'])/len(result['scores']):.1f}")
+
+    # ═══════════════════════════════════════════════════
+    #  MODO SOLO
+    # ═══════════════════════════════════════════════════
+    elif args.mode == "play":
+        print("=" * 55)
+        print("  MODO SOLO — ESPACO/cima Pular | baixo Abaixar | ESC Sair")
+        print("=" * 55)
+        pygame.init()
+        env   = DinoGame(render=True)
+        state = env.reset()
+
+        # Tela de início
+        waiting = True
+        while waiting:
+            env.display.fill(BG_COLOR)
+            env._draw_ground()
+            env.dino.draw(env.display)
+            env._draw_hud(0)
+            msg = env.font.render("PRESSIONE ESPACO PARA COMECAR", True, TEXT_COLOR)
+            env.display.blit(msg, msg.get_rect(center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2)))
+            pygame.display.flip()
+            for ev in pygame.event.get():
+                if ev.type == pygame.QUIT:
+                    pygame.quit()
+                    sys.exit()
+                if ev.type == pygame.KEYDOWN:
+                    if ev.key in (pygame.K_SPACE, pygame.K_UP):
+                        waiting = False
+                    if ev.key == pygame.K_ESCAPE:
+                        pygame.quit()
+                        sys.exit()
+            env.clock.tick(FPS)
+
+        running          = True
+        game_over_screen = False
+
+        while running:
+            action = ACTION_NONE
+
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    running = False
+                if event.type == pygame.KEYDOWN:
+                    if event.key == pygame.K_ESCAPE:
+                        running = False
+                    if game_over_screen and event.key in (pygame.K_SPACE, pygame.K_UP, pygame.K_r):
+                        state            = env.reset()
+                        game_over_screen = False
+
+            if game_over_screen:
+                env.display.fill(BG_COLOR)
+                env._update_clouds()
+                for c in env.clouds:
+                    c.draw(env.display)
+                env._draw_ground()
+                for obs in env.obstacles:
+                    obs.draw(env.display)
+                env.dino.draw(env.display, dead=True)
+                env._draw_hud(env.score)
+                env._draw_game_over_screen(env.display)
+                pygame.display.flip()
+                env.clock.tick(FPS)
+                continue
+
+            keys = pygame.key.get_pressed()
+            if keys[pygame.K_SPACE] or keys[pygame.K_UP]:
+                action = ACTION_JUMP
+            elif keys[pygame.K_DOWN]:
+                action = ACTION_DUCK
+
+            state, _, done, score = env.play_step(action)
+
+            if done:
+                game_over_screen = True
+
+        pygame.quit()

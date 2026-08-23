@@ -1,0 +1,6 @@
+pygame-ce==2.5.7
+torch
+neat-python
+stable-baselines3
+gym
+numpy
