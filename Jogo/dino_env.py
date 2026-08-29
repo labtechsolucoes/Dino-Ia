@@ -1939,7 +1939,7 @@ class DinoGame:
             
             if game_over:
                 # Desenha o texto de GAME OVER
-                self._draw_human_game_over_screen(self.display)
+                self._draw_game_over_screen(self.display)
                 
                 pygame.display.flip()
                 
